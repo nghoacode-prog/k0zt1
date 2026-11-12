@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LC79 prediction engine v16 — Short-Term Memory, Drift Killer, DB Anti-Lock."""
+"""LC79 prediction engine v17 — Trend Bias, Zero-Lock, No Random."""
 from __future__ import annotations
 import json, math, os, sqlite3
 from collections import deque
@@ -16,16 +16,13 @@ def now_iso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 def db():
-    """Khởi tạo kết nối SQLite với timeout cao để chống lỗi database is locked."""
     parent = Path(DATABASE_PATH).expanduser().resolve().parent
     parent.mkdir(parents=True, exist_ok=True)
-    # check_same_thread=False cho phép dùng kết nối trong Flask/Gunicorn
     conn = sqlite3.connect(DATABASE_PATH, timeout=60.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=60000")  # Chờ tối đa 60s nếu bị lock
-    current_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
-    if current_mode.lower() != "wal":
+    conn.execute("PRAGMA busy_timeout=60000")
+    if conn.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
         conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
@@ -132,38 +129,10 @@ def parse_upstream(raw):
     return {"sessions": sessions, "latest_id": sessions[-1]["session_id"]}
 
 
-# ============ 8 MODULE LÕI (ALWAYS SIGNAL) ============
-
-class PatternModule:
-    name = "pattern"
-    def __init__(self):
-        self.memory = {k: {} for k in range(2, 11)}
-        self.idx = 0
-    def update(self, hist, y):
-        y = int(y)
-        for order in range(2, 11):
-            if len(hist) >= order:
-                seq = tuple(hist[-order:])
-                cell = self.memory[order].setdefault(seq, [0.0, 0.0, self.idx])
-                cell[y] += 1.0
-                cell[2] = self.idx
-        self.idx += 1
-    def predict(self, hist):
-        if len(hist) < 2: return 0.5, 0.1
-        for order in range(10, 1, -1):
-            if len(hist) < order: continue
-            cell = self.memory[order].get(tuple(hist[-order:]))
-            if cell:
-                c0, c1, last_idx = cell
-                total = c0 + c1
-                if total >= 1:
-                    p = (c1 + 1.0) / (total + 2.0)
-                    conf = min(1.0, total / 5.0) if (self.idx - last_idx) < 50 else 0.2
-                    return p, max(0.1, conf)
-        p = sum(hist[-3:]) / 3.0
-        return max(0.1, min(0.9, p)), 0.1
+# ============ 3 MODULE THỰC DỤNG (Bỏ ảo giác) ============
 
 class TrendModule:
+    """1. Bám xu hướng ngắn hạn (EMA)."""
     name = "trend"
     def __init__(self):
         self.fast = 0.5; self.slow = 0.5
@@ -177,6 +146,7 @@ class TrendModule:
         return p, max(0.1, min(1.0, conf))
 
 class StreakModule:
+    """2. Bám cầu bệt. (Chỉ bám nếu tỷ lệ tiếp diễn > 52%)."""
     name = "streak"
     def __init__(self): self.stats = {}
     def update(self, hist, y):
@@ -197,80 +167,35 @@ class StreakModule:
         cell = self.stats.get((side, min(run, 8)), [1.0, 1.0])
         p_cont = cell[0] / (cell[0] + cell[1])
         p = p_cont if side == 1 else 1.0 - p_cont
+        # Nếu xác suất tiếp diễn thấp, trả về 0.5 (đéo đánh bệt)
+        if p_cont < 0.52: return 0.5, 0.1
         conf = min(1.0, (cell[0] + cell[1]) / 10.0)
         return p, max(0.1, conf)
 
-class AlternatingModule:
-    name = "alternating"
+class BiasModule:
+    """3. Đo lường độ lệch (Bias) dài hạn. 100 phiên gần nhất."""
+    name = "bias"
     def predict(self, hist):
-        if len(hist) < 4: return 0.5, 0.1
-        if hist[-1] != hist[-2] and hist[-2] != hist[-3] and hist[-3] != hist[-4]:
-            return (1.0 - hist[-1]), 0.85
-        if len(hist) >= 6:
-            if hist[-1] == hist[-2] and hist[-3] == hist[-4] and hist[-5] == hist[-6] and hist[-2] != hist[-3]:
-                return (1.0 - hist[-1]), 0.9
-        return 0.5, 0.1
-
-class CycleModule:
-    name = "cycle"
-    def predict(self, hist):
-        if len(hist) < 6: return 0.5, 0.1
-        for lag in (2, 3, 4):
-            if len(hist) >= lag * 2:
-                if hist[-1] == hist[-1-lag] and hist[-2] == hist[-2-lag]:
-                    return float(hist[-lag]), 0.75
-        return 0.5, 0.1
-
-class MomentumModule:
-    name = "momentum"
-    def predict(self, hist):
-        if len(hist) < 5: return 0.5, 0.1
-        p5 = sum(hist[-5:]) / 5.0
-        p20 = sum(hist[-20:]) / len(hist[-20:])
-        conf = abs(p5 - p20) * 4 + 0.1
-        return p5, max(0.1, min(1.0, conf))
-
-class FrequencyModule:
-    name = "frequency"
-    def predict(self, hist):
-        if not hist: return 0.5, 0.1
-        decay = 0.9; a = b = 0.0
-        for v in hist:
-            a *= decay; b *= decay
-            if v: a += 1.0
-            else: b += 1.0
-        p = a / (a + b)
-        conf = abs(p - 0.5) * 2 + 0.1
-        return p, max(0.1, min(1.0, conf))
-
-class BaseRateModule:
-    name = "base_rate"
-    def predict(self, hist):
-        if not hist: return 0.5, 0.1
-        p = (sum(hist) + 1.0) / (len(hist) + 2.0)
-        return p, 0.2
+        if len(hist) < 20: return 0.5, 0.1
+        p_tai = sum(hist[-100:]) / len(hist[-100:])
+        conf = abs(p_tai - 0.5) * 4
+        return p_tai, max(0.1, min(1.0, conf))
 
 
-# ============ ENGINE V16 ============
+# ============ ENGINE V17 ============
 
 class PredictionEngine:
-    EXPERTS = ("pattern", "trend", "streak", "alternating", "cycle", "momentum", "frequency", "base_rate")
+    EXPERTS = ("trend", "streak", "bias")
     
     def __init__(self, history=None, table_code=""):
         self.table_code = table_code
         self.history = []
-        self.pattern = PatternModule()
         self.trend = TrendModule()
         self.streak = StreakModule()
-        self.alt = AlternatingModule()
-        self.cycle = CycleModule()
-        self.momentum = MomentumModule()
-        self.frequency = FrequencyModule()
-        self.base_rate = BaseRateModule()
+        self.bias = BiasModule()
         
-        # Short-term memory (5 phiên) và đếm chuỗi thua
-        self.memory_5 = {n: deque(maxlen=5) for n in self.EXPERTS}
-        self.fails = {n: 0 for n in self.EXPERTS}
+        # Lưu trữ kết quả 20 phiên của từng module để đánh giá
+        self.recent_results = {n: deque(maxlen=20) for n in self.EXPERTS}
         
         for v in list(history or []): self._update(1 if int(v) == 1 else 0)
 
@@ -279,68 +204,47 @@ class PredictionEngine:
         if len(hist) >= 10:
             preds = self._get_all_preds(hist)
             for name, (p, c) in preds.items():
-                is_correct = int((1 if p >= 0.5 else 0) == y)
-                self.memory_5[name].append((is_correct, c))
-                if is_correct: self.fails[name] = 0
-                else: self.fails[name] += 1
+                # Chỉ chấm điểm nếu module thực sự đưa ra tín hiệu (p != 0.5)
+                if abs(p - 0.5) > 0.01:
+                    is_correct = int((1 if p >= 0.5 else 0) == y)
+                    self.recent_results[name].append(is_correct)
 
-        self.pattern.update(hist, y)
         self.trend.update(hist, y)
         self.streak.update(hist, y)
         self.history.append(y)
 
     def _get_all_preds(self, hist):
         return {
-            "pattern": self.pattern.predict(hist),
             "trend": self.trend.predict(hist),
             "streak": self.streak.predict(hist),
-            "alternating": self.alt.predict(hist),
-            "cycle": self.cycle.predict(hist),
-            "momentum": self.momentum.predict(hist),
-            "frequency": self.frequency.predict(hist),
-            "base_rate": self.base_rate.predict(hist)
+            "bias": self.bias.predict(hist)
         }
 
     def predict(self, accuracy_100=.5, accuracy_500=.5):
         n = len(self.history)
-        if n < 10:
-            last = self.history[-1] if self.history else 1
-            return {
-                "side": "TAI" if last == 1 else "XIU", "confidence": 58, 
-                "p_internal": 0.6 if last == 1 else 0.4, "regime": "WARMUP", 
-                "regime_conf": 0.0, "skip": False, "reason": None, 
-                "modules": {}, "full": {"modules": {}, "p_internal": 0.5, "explanation": "Warmup"}
-            }
-
-        raw_preds = self._get_all_preds(self.history)
-        final_preds = {}
         
+        # Lấy ý kiến 3 module
+        preds = self._get_all_preds(self.history)
+        
+        final_preds = {}
         for name in self.EXPERTS:
-            p, base_conf = raw_preds[name]
+            p, base_conf = preds[name]
             
-            # Auto-Invert: Sai >= 3 phiên và tự tin > 0.6 -> Đảo ngược kết quả
-            if self.fails[name] >= 3 and base_conf >= 0.6:
-                p = 1.0 - p
-            
-            # Short-Term Memory Weight: Bóp nghẹt trọng số nếu vừa sai
+            # Trọng số tự động: Nếu 20 phiên gần nhất module này đoán đúng > 50%, tăng weight
             weight = base_conf
-            mem = self.memory_5[name]
+            if self.recent_results[name]:
+                acc = sum(self.recent_results[name]) / len(self.recent_results[name])
+                weight *= max(0.2, acc * 2.0)
             
-            if mem:
-                if mem[-1][0] == 0:
-                    weight *= 0.1
-                if len(mem) >= 2 and mem[-2][0] == 0:
-                    weight *= 0.1
-                recent_accuracy = sum(m[0] for m in mem) / len(mem)
-                weight *= max(0.1, recent_accuracy * 2.0)
-
             final_preds[name] = [p, max(0.01, weight)]
 
         total_w = sum(final_preds[k][1] for k in self.EXPERTS)
         p_raw = sum(final_preds[k][0] * final_preds[k][1] for k in self.EXPERTS) / total_w
 
-        if abs(p_raw - 0.5) < 1e-4:
-            p_raw = 0.505 if self.history[-1] == 1 else 0.495
+        # Đảm bảo có kết quả rõ ràng, không kẹt 0.5
+        if abs(p_raw - 0.5) < 0.01:
+            # Nếu đéo có tín hiệu gì, bám theo phiên cuối cùng (đéo đoán đảo)
+            p_raw = 0.52 if self.history[-1] == 1 else 0.48
 
         p_raw = max(0.05, min(0.95, p_raw))
         edge = abs(p_raw - 0.5) * 2
@@ -355,7 +259,7 @@ class PredictionEngine:
         return {
             "side": side, "confidence": confidence, "p_internal": p_raw,
             "regime": "AUTO", "regime_conf": edge, "skip": False, "reason": None,
-            "modules": mv, "full": {"modules": mv, "p_internal": round(p_raw, 4), "explanation": "Short-Term Drift Killer"}
+            "modules": mv, "full": {"modules": mv, "p_internal": round(p_raw, 4), "explanation": "Trend Following"}
         }
 
     def observe(self, result):
@@ -374,33 +278,19 @@ class PredictionEngine:
 # ============ BACKTEST & HELPERS ============
 class Backtest:
     @staticmethod
-    def run(history, warmup=30):
+    def run(history, warmup=10):
         eng = PredictionEngine()
         rows, correct = [], 0
-        by_regime, by_conf, by_side = {}, {}, {}
-        by_module = {n: [0, 0] for n in PredictionEngine.EXPERTS}
-        wins = losses = bestw = bestl = 0
         for y in history:
             pred = eng.predict()
             if len(eng.history) >= warmup and not pred.get("skip"):
                 side = pred.get("side")
                 ok = side == ("TAI" if y else "XIU")
                 correct += int(ok)
-                wins = wins + 1 if ok else 0
-                losses = losses + 1 if not ok else 0
-                bestw, bestl = max(bestw, wins), max(bestl, losses)
-                for mn, mv in pred.get("modules", {}).items():
-                    mok = (float(mv.get("p", 0.5)) >= 0.5) == bool(y)
-                    by_module[mn][0] += 1
-                    by_module[mn][1] += int(mok)
-                r = pred.get("regime", "AUTO")
-                bucket = str((pred.get("confidence", 50) // 5) * 5)
-                for d, k in ((by_regime, r), (by_conf, bucket), (by_side, side)):
-                    d.setdefault(k, [0, 0]); d[k][0] += 1; d[k][1] += int(ok)
-                rows.append({"actual": y, "prediction": side, "correct": ok, "regime": r, "confidence": pred.get("confidence", 50)})
+                rows.append({"actual": y, "prediction": side, "correct": ok})
             eng.observe(y)
         total = len(rows)
-        return {"total_predictions": total, "correct": correct, "accuracy": correct / total if total else 0.0, "by_regime": by_regime, "by_confidence_bucket": by_conf, "by_side": by_side, "by_module": {k: {"votes": v[0], "correct": v[1], "accuracy": v[1] / v[0] if v[0] else 0.0} for k, v in by_module.items()}, "streak_wins": bestw, "streak_losses": bestl, "timeline": rows}
+        return {"total_predictions": total, "correct": correct, "accuracy": correct / total if total else 0.0, "timeline": rows}
 
 def resolve_actual(table_code, sessions):
     c = db(); count = 0
