@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LC79 prediction engine v12 — Instant Reaction, Streak Breaker, Ép 58-72%."""
+"""LC79 prediction engine v12.1 — Instant Reaction, Streak Breaker, Ép 58-72% (Fixed Import)."""
 from __future__ import annotations
 import json, math, os, sqlite3
 from collections import deque
@@ -131,7 +131,6 @@ def parse_upstream(raw):
 # ============ 4 MODULE LÕI ============
 
 class PatternModule:
-    """Dò tìm Pattern từ 2-10 phiên trong quá khứ."""
     name = "pattern"
     def __init__(self):
         self.memory = {k: {} for k in range(2, 11)}
@@ -167,7 +166,6 @@ class PatternModule:
 
 
 class StreakModule:
-    """CHỐNG BỆT NGU: Chỉ kích hoạt khi thực sự có xác suất bệt > 55%."""
     name = "streak"
     def __init__(self):
         self.stats = {}
@@ -187,25 +185,22 @@ class StreakModule:
         for v in reversed(hist[:-1]):
             if v != side: break
             run += 1
-            
         cell = self.stats.get((side, min(run, 8)), [1.0, 1.0])
         p_cont = cell[0] / (cell[0] + cell[1])
         
-        if run < 4: return 0.5, 0.0 # Bệt < 4 phiên đéo tin
-        if p_cont < 0.55: return 0.5, 0.0 # Xác suất tiếp diễn phải > 55%
+        if run < 4: return 0.5, 0.0
+        if p_cont < 0.55: return 0.5, 0.0
         
         p = p_cont if side == 1 else 1.0 - p_cont
         return p, min(1.0, sum(cell) / 15.0)
 
 
 class AlternatingModule:
-    """Bắt cầu đảo 1-1, 2-2."""
     name = "alternating"
     def predict(self, hist):
         if len(hist) < 6: return 0.5, 0.0
         if all(hist[-i] != hist[-i-1] for i in range(1, 6)):
             return (1.0 - hist[-1]), 0.85
-            
         tail8 = hist[-8:]
         blocks = []
         cur = tail8[0]; cnt = 1
@@ -219,7 +214,6 @@ class AlternatingModule:
 
 
 class TrendModule:
-    """Trend rõ ràng mới đánh."""
     name = "trend"
     def __init__(self):
         self.fast_a = 1.0 - 0.5 ** (1.0/10.0)
@@ -234,13 +228,13 @@ class TrendModule:
 
     def predict(self, hist):
         mom = self.fast - self.slow
-        if abs(mom) < 0.1: return 0.5, 0.0 # Trend yếu đéo đánh
+        if abs(mom) < 0.1: return 0.5, 0.0
         p = self.fast + 0.5 * mom
         p = max(0.05, min(0.95, p))
         return p, min(1.0, abs(mom) * 4)
 
 
-# ============ ENGINE V12 (INSTANT REACTION) ============
+# ============ ENGINE V12.1 ============
 
 class PredictionEngine:
     EXPERTS = ("pattern", "streak", "alternating", "trend")
@@ -253,34 +247,26 @@ class PredictionEngine:
         self.alt = AlternatingModule()
         self.trend = TrendModule()
         
-        # Track chuỗi thua liên tiếp để Auto-Invert
         self.fails = {n: 0 for n in self.EXPERTS}
-        
         for v in list(history or []): self._update(1 if int(v) == 1 else 0)
 
     def _update(self, y):
         hist = self.history[:]
-        
-        # Đánh giá kết quả của phiên vừa rồi để cộng/trừ điểm phạt
         if len(hist) >= 15:
             p_pat, c_pat = self.pattern.predict(hist)
             p_st, c_st = self.streak.predict(hist)
             p_al, c_al = self.alt.predict(hist)
             p_tr, c_tr = self.trend.predict(hist)
             
-            # Nếu module có tín hiệu, kiểm tra xem nó đúng hay sai
             if c_pat > 0:
                 if (1 if p_pat >= 0.5 else 0) != y: self.fails["pattern"] += 1
                 else: self.fails["pattern"] = 0
-                
             if c_st > 0:
                 if (1 if p_st >= 0.5 else 0) != y: self.fails["streak"] += 1
                 else: self.fails["streak"] = 0
-                
             if c_al > 0:
                 if (1 if p_al >= 0.5 else 0) != y: self.fails["alternating"] += 1
                 else: self.fails["alternating"] = 0
-                
             if c_tr > 0:
                 if (1 if p_tr >= 0.5 else 0) != y: self.fails["trend"] += 1
                 else: self.fails["trend"] = 0
@@ -306,19 +292,11 @@ class PredictionEngine:
         p_al, c_al = self.alt.predict(self.history)
         p_tr, c_tr = self.trend.predict(self.history)
 
-        # Logic Instant Reaction
         def apply_instant_reaction(name, p, c):
             if c == 0.0: return 0.5, 0.0
             fails = self.fails[name]
-            
-            # 1. Sai 2 phiên liên tiếp -> CÚT (Weight = 0)
-            if fails == 2:
-                return 0.5, 0.0
-            
-            # 2. Sai >= 3 phiên liên tiếp -> AUTO INVERT (Đảo ngược)
-            if fails >= 3:
-                return 1.0 - p, c  # Trả về xác suất đảo ngược
-                
+            if fails == 2: return 0.5, 0.0
+            if fails >= 3: return 1.0 - p, c
             return p, c
 
         p_pat, c_pat = apply_instant_reaction("pattern", p_pat, c_pat)
@@ -326,20 +304,18 @@ class PredictionEngine:
         p_al, c_al = apply_instant_reaction("alternating", p_al, c_al)
         p_tr, c_tr = apply_instant_reaction("trend", p_tr, c_tr)
 
-        # Lọc Bias: Nếu 10 phiên gần nhất lệch > 70% về 1 bên, phạt các module đi ngược
         if len(self.history) >= 10:
             recent_tai = sum(self.history[-10:])
-            if recent_tai >= 7: # Thiên TÀI
+            if recent_tai >= 7:
                 if p_pat < 0.5: p_pat = 0.5; c_pat = 0.0
                 if p_st < 0.5: p_st = 0.5; c_st = 0.0
-            elif recent_tai <= 3: # Thiên XỈU
+            elif recent_tai <= 3:
                 if p_pat > 0.5: p_pat = 0.5; c_pat = 0.0
                 if p_st > 0.5: p_st = 0.5; c_st = 0.0
 
         total_w = c_pat + c_st + c_al + c_tr
 
         if total_w == 0.0:
-            # Fallback: Nếu tất cả tịt, dùng Pattern 3 phiên
             cell3 = self.pattern.memory[3].get(tuple(self.history[-3:]))
             if cell3 and sum(cell3[:2]) >= 1:
                 p_raw = (cell3[1] + 1.0) / (sum(cell3[:2]) + 2.0)
@@ -353,7 +329,6 @@ class PredictionEngine:
         edge = abs(p_raw - 0.5) * 2
         side = "TAI" if p_raw >= 0.5 else "XIU"
 
-        # ÉP CHUẨN 58-72%
         confidence = int(round(58 + 14 * edge))
         confidence = max(58, min(72, confidence))
 
@@ -381,6 +356,67 @@ class PredictionEngine:
     def from_dict(cls, data):
         if not isinstance(data, dict): return cls()
         return cls(history=data.get("history", []), table_code=data.get("table_code", ""))
+
+
+# ============ BACKTEST CLASS (Bổ sung để fix lỗi Import) ============
+class Backtest:
+    @staticmethod
+    def run(history, warmup=30):
+        eng = PredictionEngine()
+        rows = []
+        correct = 0
+        by_regime = {}
+        by_conf = {}
+        by_side = {}
+        by_module = {n: [0, 0] for n in PredictionEngine.EXPERTS}
+        wins = losses = bestw = bestl = 0
+        
+        for y in history:
+            pred = eng.predict()
+            if len(eng.history) >= warmup and not pred.get("skip"):
+                side = pred.get("side")
+                ok = side == ("TAI" if y else "XIU")
+                correct += int(ok)
+                wins = wins + 1 if ok else 0
+                losses = losses + 1 if not ok else 0
+                bestw = max(bestw, wins)
+                bestl = max(bestl, losses)
+                
+                for mn, mv in pred.get("modules", {}).items():
+                    mok = (float(mv.get("p", 0.5)) >= 0.5) == bool(y)
+                    by_module[mn][0] += 1
+                    by_module[mn][1] += int(mok)
+                    
+                r = pred.get("regime", "AUTO")
+                bucket = str((pred.get("confidence", 50) // 5) * 5)
+                by_regime.setdefault(r, [0, 0])
+                by_regime[r][0] += 1
+                by_regime[r][1] += int(ok)
+                
+                by_conf.setdefault(bucket, [0, 0])
+                by_conf[bucket][0] += 1
+                by_conf[bucket][1] += int(ok)
+                
+                by_side.setdefault(side, [0, 0])
+                by_side[side][0] += 1
+                by_side[side][1] += int(ok)
+                
+                rows.append({"actual": y, "prediction": side, "correct": ok, "regime": r, "confidence": pred.get("confidence", 50)})
+            eng.observe(y)
+            
+        total = len(rows)
+        return {
+            "total_predictions": total,
+            "correct": correct,
+            "accuracy": correct / total if total else 0.0,
+            "by_regime": by_regime,
+            "by_confidence_bucket": by_conf,
+            "by_side": by_side,
+            "by_module": {k: {"votes": v[0], "correct": v[1], "accuracy": v[1] / v[0] if v[0] else 0.0} for k, v in by_module.items()},
+            "streak_wins": bestw,
+            "streak_losses": bestl,
+            "timeline": rows,
+        }
 
 
 # ==============================================================================
@@ -444,7 +480,7 @@ def mark_poll_ok(table_code):
     conn = db(); conn.execute("UPDATE table_states SET last_poll_at=?,last_poll_error=NULL,updated_at=? WHERE table_code=?", (now_iso(), now_iso(), table_code)); conn.commit(); conn.close()
 
 def mark_poll_error(table_code, error):
-    conn = db(); conn.execute("UPDATE table_states SET last_poll_at=?,last_poll_error=?,updated_at=? WHERE table_code=?",  (now_iso(), str(error)[:500], now_iso(), table_code)); conn.commit(); conn.close()
+    conn = db(); conn.execute("UPDATE table_states SET last_poll_at=?,last_poll_error=?,updated_at=? WHERE table_code=?", (now_iso(), str(error)[:500], now_iso(), table_code)); conn.commit(); conn.close()
 
 def accuracy(table_code, limit=100):
     conn = db(); rows = conn.execute("SELECT result FROM predictions WHERE table_code=? AND result IN ('win','lose') ORDER BY session_id DESC LIMIT ?", (table_code, int(limit))).fetchall(); conn.close()
